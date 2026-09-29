@@ -2,10 +2,9 @@
 FROM maven:3.9-eclipse-temurin-17 AS build
 WORKDIR /build
 
-# Warm the dependency layer so code-only changes rebuild fast
+# Single Maven pass. dependency:go-offline is deliberately avoided: it resolves
+# test and plugin artifacts too and fails on some of them, which breaks deploys.
 COPY pom.xml .
-RUN mvn -B -q dependency:go-offline
-
 COPY src ./src
 RUN mvn -B clean package -DskipTests
 
