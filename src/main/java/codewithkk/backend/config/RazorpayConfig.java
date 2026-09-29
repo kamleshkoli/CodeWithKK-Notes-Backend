@@ -23,4 +23,13 @@ public class RazorpayConfig {
     public String getKeyId() {
         return keyId;
     }
+
+    public String getKeySecret() {
+        return keySecret;
+    }
+
+    public boolean isConfigured() {
+        return keyId != null && !keyId.isBlank()
+                && keySecret != null && !keySecret.isBlank();
+    }
 }

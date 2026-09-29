@@ -32,8 +32,21 @@ public class UserController {
         return ResponseEntity.ok(userService.getUserProfile(userId));
     }
 
+    /**
+     * Updates the caller's own profile only. The id comes from the JWT, so a
+     * request against another user's id is rejected rather than honoured, and
+     * role changes are ignored on this path.
+     */
     @PutMapping("/profile/{userId}")
-    public ResponseEntity<User> updateProfile(@PathVariable String userId, @RequestBody User user) {
-        return ResponseEntity.ok(userService.updateUser(userId, user));
+    public ResponseEntity<?> updateProfile(@PathVariable String userId, @RequestBody User user) {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || !(auth.getPrincipal() instanceof UserDetails userDetails)) {
+            return ResponseEntity.status(401).build();
+        }
+        String callerId = userService.getMe(userDetails.getUsername()).getId();
+        if (!callerId.equals(userId)) {
+            return ResponseEntity.status(403).build();
+        }
+        return ResponseEntity.ok(userService.updateOwnProfile(userId, userDetails.getUsername(), user));
     }
 }

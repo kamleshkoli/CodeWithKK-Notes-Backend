@@ -45,6 +45,22 @@ public class UserService {
                 user.getRole(), user.getCreatedAt(), hasPurchased);
     }
 
+    /**
+     * Self-service profile update. Deliberately ignores the incoming role, email
+     * and id so a user cannot promote themselves to ADMIN by posting
+     * {"role":"ROLE_ADMIN"} to a public endpoint.
+     */
+    public User updateOwnProfile(String userId, String email, User submitted) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new RuntimeException("User not found"));
+        if (submitted.getName() != null) user.setName(submitted.getName());
+        if (submitted.getPassword() != null && !submitted.getPassword().isBlank()) {
+            user.setPassword(passwordEncoder.encode(submitted.getPassword()));
+        }
+        return userRepository.save(user);
+    }
+
+    /** Admin-only update. This is the one path allowed to change role. */
     public User updateUser(String userId, User updated) {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new RuntimeException("User not found"));
