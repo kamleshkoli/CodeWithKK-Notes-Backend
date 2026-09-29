@@ -10,6 +10,8 @@ import com.razorpay.Order;
 import com.razorpay.RazorpayClient;
 import com.razorpay.RazorpayException;
 import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -21,6 +23,8 @@ import java.util.Optional;
 
 @Service
 public class PaymentService {
+
+    private static final Logger log = LoggerFactory.getLogger(PaymentService.class);
 
     @Autowired
     private RazorpayClient razorpayClient;
@@ -55,7 +59,13 @@ public class PaymentService {
                     razorpayConfig.getKeyId()
             );
         } catch (RazorpayException e) {
-            throw new RuntimeException("Failed to create Razorpay order", e);
+            // Surface Razorpay's own description. Without it every credential or
+            // network problem collapses into one opaque "failed" and the real
+            // cause has to be guessed at from a log the user cannot see.
+            // keyId is logged (it is public); the secret is never logged.
+            log.error("Razorpay order creation failed. keyId={} amount={} currency={} reason={}",
+                    razorpayConfig.getKeyId(), amount, currency, e.getMessage(), e);
+            throw new RuntimeException("Failed to create Razorpay order: " + e.getMessage(), e);
         }
     }
 
