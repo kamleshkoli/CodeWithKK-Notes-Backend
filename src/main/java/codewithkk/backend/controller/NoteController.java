@@ -6,6 +6,7 @@ import codewithkk.backend.entity.Note;
 import codewithkk.backend.entity.User;
 import codewithkk.backend.repository.BundlePurchaseRepository;
 import codewithkk.backend.repository.UserRepository;
+import codewithkk.backend.service.DownloadTicketService;
 import codewithkk.backend.service.FileUploadService;
 import codewithkk.backend.service.NoteService;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -23,7 +24,9 @@ import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBo
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 @RestController
@@ -42,6 +45,9 @@ public class NoteController {
 
     @Autowired
     private BundlePurchaseRepository bundlePurchaseRepository;
+
+    @Autowired
+    private DownloadTicketService downloadTicketService;
 
     // ---------- public catalogue (no pdfUrl, ever) ----------
 
@@ -64,30 +70,79 @@ public class NoteController {
     // ---------- protected delivery ----------
 
     /**
-     * Streams the PDF only to a buyer. The storage URL is never disclosed, and
-     * the bytes are piped straight through instead of being buffered in heap,
-     * which matters on a 512MB instance.
+     * Mints a short-lived download ticket for a note the caller is entitled to.
+     *
+     * <p>Requires the same JWT + completed-purchase check as the download
+     * endpoint itself, so this cannot be used to obtain access to anything the
+     * caller could not already fetch.
      */
-    @GetMapping("/{id}/download")
-    public ResponseEntity<StreamingResponseBody> downloadNote(@PathVariable String id) {
+    @PostMapping("/{id}/download-ticket")
+    public ResponseEntity<Map<String, Object>> createDownloadTicket(
+            @PathVariable String id,
+            @RequestParam(required = false) String disposition) {
 
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        if (auth == null || auth.getName() == null) {
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
-        }
-
-        Optional<User> user = userRepository.findByEmail(auth.getName());
+        Optional<User> user = currentUser();
         if (user.isEmpty()) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
+        if (!hasAccess(user.get())) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+        }
 
-        boolean isAdmin = user.get().getRole() != null
-                && user.get().getRole().equals("ROLE_ADMIN");
+        Note note = noteService.getNoteById(id);
+        if (note == null || note.getPdfUrl() == null || note.getPdfUrl().isBlank()) {
+            return ResponseEntity.notFound().build();
+        }
 
-        if (!isAdmin) {
-            Optional<BundlePurchase> purchase =
-                    bundlePurchaseRepository.findByUserId(user.get().getId());
-            if (purchase.isEmpty() || !"completed".equals(purchase.get().getStatus())) {
+        String token = downloadTicketService.issue(user.get().getId(), id);
+
+        Map<String, Object> body = new HashMap<>();
+        body.put("url", "/api/notes/" + id + "/download?ticket=" + token);
+        body.put("filename", sanitizeFilename(note.getTitle()) + ".pdf");
+        body.put("expiresInSeconds", 120);
+        // Lets the client ask for inline rendering instead of a forced download.
+        // Android WebViews cannot display PDFs, so callers there should keep the
+        // default "attachment" and let the OS save the file.
+        body.put("disposition", "inline".equalsIgnoreCase(disposition) ? "inline" : "attachment");
+        return ResponseEntity.ok(body);
+    }
+
+    /**
+     * Streams the PDF only to a buyer. The storage URL is never disclosed, and
+     * the bytes are piped straight through instead of being buffered in heap,
+     * which matters on a 512MB instance.
+     *
+     * <p>Accepts either the bearer token (desktop, axios) or a single-use
+     * download ticket (mobile, plain navigation). Both paths re-check the
+     * purchase on every request.
+     */
+    @GetMapping("/{id}/download")
+    public ResponseEntity<StreamingResponseBody> downloadNote(
+            @PathVariable String id,
+            @RequestParam(required = false) String ticket,
+            @RequestParam(required = false) String disposition) {
+
+        Optional<User> user = currentUser();
+
+        if (ticket != null && !ticket.isBlank()) {
+            Optional<DownloadTicketService.Ticket> valid =
+                    downloadTicketService.consume(ticket, id);
+            if (valid.isEmpty()) {
+                // Expired, already used, or forged. Never falls back to trusting
+                // the ticket's contents.
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+            }
+            // Re-verify entitlement rather than trusting the ticket alone, so a
+            // revoked user cannot use a ticket minted moments earlier.
+            user = userRepository.findById(valid.get().userId());
+            if (user.isEmpty() || !hasAccess(user.get())) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+            }
+        } else {
+            if (user.isEmpty()) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            }
+            if (!hasAccess(user.get())) {
                 return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
             }
         }
@@ -98,13 +153,35 @@ public class NoteController {
         }
 
         final String filename = sanitizeFilename(note.getTitle()) + ".pdf";
+        final boolean inline = "inline".equalsIgnoreCase(disposition);
         StreamingResponseBody body = out -> copyTo(note.getPdfUrl(), out);
 
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_PDF)
                 .header(HttpHeaders.CONTENT_DISPOSITION,
-                        "attachment; filename=\"" + filename + "\"")
+                        (inline ? "inline" : "attachment") + "; filename=\"" + filename
+                                + "\"; filename*=UTF-8''"
+                                + java.net.URLEncoder.encode(filename, java.nio.charset.StandardCharsets.UTF_8))
                 .body(body);
+    }
+
+    private Optional<User> currentUser() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || auth.getName() == null) {
+            return Optional.empty();
+        }
+        return userRepository.findByEmail(auth.getName());
+    }
+
+    /** Admins keep access by role; everyone else needs a completed purchase. */
+    private boolean hasAccess(User user) {
+        if (user.getRole() != null && user.getRole().equals("ROLE_ADMIN")) {
+            return true;
+        }
+        // listByUserId rather than findByUserId: a user with more than one
+        // purchase row would make the Optional-returning finder throw.
+        return bundlePurchaseRepository.listByUserId(user.getId()).stream()
+                .anyMatch(p -> "completed".equals(p.getStatus()));
     }
 
     /** Copies from local disk or a remote store without ever holding the whole file. */

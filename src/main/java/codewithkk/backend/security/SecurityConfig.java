@@ -42,6 +42,14 @@ public class SecurityConfig {
 
                         // --- admin only: catalogue writes, uploads, admin console ---
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
+
+                        // Minting a ticket is a buyer action, not a catalogue write, so
+                        // it must be listed before the blanket POST rule below -
+                        // otherwise /api/notes/{id}/download-ticket would be treated
+                        // as a note creation and demand ROLE_ADMIN.
+                        .requestMatchers(HttpMethod.POST, "/api/notes/*/download-ticket")
+                        .authenticated()
+
                         .requestMatchers(HttpMethod.POST, "/api/notes/**").hasRole("ADMIN")
                         .requestMatchers(HttpMethod.PUT, "/api/notes/**").hasRole("ADMIN")
                         .requestMatchers(HttpMethod.DELETE, "/api/notes/**").hasRole("ADMIN")
@@ -49,7 +57,21 @@ public class SecurityConfig {
                         .requestMatchers("/api/files/**").hasRole("ADMIN")
 
                         // --- signed-in users ---
-                        .requestMatchers("/api/notes/*/download").authenticated()
+                        // NOTE: /api/notes/*/download is deliberately NOT listed here.
+                        //
+                        // It is reached by a plain browser navigation (a tap), which
+                        // cannot attach the Authorization header that lives in
+                        // localStorage. Requiring authentication at the filter layer
+                        // would reject every legitimate mobile download with a 403
+                        // before the controller ran.
+                        //
+                        // Authorization is NOT skipped - it moved into
+                        // NoteController.downloadNote, which accepts either
+                        //   (a) a valid JWT + completed purchase, or
+                        //   (b) a single-use, 2-minute ticket that was itself only
+                        //       mintable after a completed-purchase check, and which
+                        //       re-verifies the purchase before streaming a byte.
+                        // Anything else returns 401/403 and no PDF is written.
                         .requestMatchers("/api/payment/**").authenticated()
                         .requestMatchers("/api/bundle/**").authenticated()
                         .requestMatchers("/api/user/**").authenticated()
