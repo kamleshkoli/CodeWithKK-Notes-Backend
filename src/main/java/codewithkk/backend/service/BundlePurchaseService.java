@@ -27,7 +27,11 @@ public class BundlePurchaseService {
                 .or(() -> purchases.stream().findFirst());
     }
 
+    /**
+     * Only a completed row counts. A pending or failed payment must never look
+     * like access, so the status is part of the check rather than implied.
+     */
     public boolean hasPurchased(String userId) {
-        return bundlePurchaseRepository.existsByUserId(userId);
+        return bundlePurchaseRepository.existsByUserIdAndStatus(userId, "completed");
     }
 }

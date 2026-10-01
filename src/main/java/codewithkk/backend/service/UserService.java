@@ -37,7 +37,7 @@ public class UserService {
     public UserProfileResponse getUserProfile(String userId) {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new RuntimeException("User not found"));
-        boolean hasPurchased = bundlePurchaseRepository.existsByUserId(userId);
+        boolean hasPurchased = bundlePurchaseRepository.existsByUserIdAndStatus(userId, "completed");
         return new UserProfileResponse(user.getId(), user.getName(), user.getEmail(),
                 user.getRole(), user.getCreatedAt(), hasPurchased);
     }
@@ -45,7 +45,7 @@ public class UserService {
     public UserProfileResponse getMe(String email) {
         User user = userRepository.findByEmail(email)
                 .orElseThrow(() -> new RuntimeException("User not found"));
-        boolean hasPurchased = bundlePurchaseRepository.existsByUserId(user.getId());
+        boolean hasPurchased = bundlePurchaseRepository.existsByUserIdAndStatus(user.getId(), "completed");
         return new UserProfileResponse(user.getId(), user.getName(), user.getEmail(),
                 user.getRole(), user.getCreatedAt(), hasPurchased);
     }
@@ -77,7 +77,10 @@ public class UserService {
         return userRepository.save(user);
     }
 
+    /** Removes the user and their purchase rows, so no orphan grants survive. */
+    @Transactional
     public void deleteUser(String userId) {
+        bundlePurchaseRepository.deleteAll(bundlePurchaseRepository.listByUserId(userId));
         userRepository.deleteById(userId);
     }
 
@@ -149,9 +152,11 @@ public class UserService {
         User user = userRepository.findByEmail(email.trim())
                 .orElseThrow(() -> new IllegalArgumentException("No user found with email " + email));
 
-        Optional<BundlePurchase> existing = bundlePurchaseRepository.findByUserId(user.getId());
-        if (existing.isPresent()) {
-            BundlePurchase purchase = existing.get();
+        // Newest row first, and tolerate duplicates: grant must never throw
+        // just because history contains an extra row.
+        List<BundlePurchase> rows = bundlePurchaseRepository.listByUserId(user.getId());
+        if (!rows.isEmpty()) {
+            BundlePurchase purchase = rows.get(0);
             // Re-granting a revoked user restores them; re-granting an active
             // user is a no-op rather than an error.
             if (!"completed".equals(purchase.getStatus())) {
@@ -185,7 +190,11 @@ public class UserService {
         if (!userRepository.existsById(userId)) {
             throw new IllegalArgumentException("User not found");
         }
-        bundlePurchaseRepository.deleteByUserId(userId);
+        // Explicit delete-by-entity rather than a derived deleteBy... query:
+        // the derived form returning a count is resolved as a select and fails
+        // casting the entity to Long.
+        List<BundlePurchase> rows = bundlePurchaseRepository.listByUserId(userId);
+        bundlePurchaseRepository.deleteAll(rows);
     }
 
     public StatsResponse getStats() {
