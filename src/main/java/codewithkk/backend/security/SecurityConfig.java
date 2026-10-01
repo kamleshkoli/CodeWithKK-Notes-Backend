@@ -56,22 +56,28 @@ public class SecurityConfig {
                         .requestMatchers("/api/upload/**").hasRole("ADMIN")
                         .requestMatchers("/api/files/**").hasRole("ADMIN")
 
-                        // --- signed-in users ---
-                        // NOTE: /api/notes/*/download is deliberately NOT listed here.
+                        // --- protected file delivery ---
+                        // /api/notes/*/download MUST be permitted at the filter layer.
                         //
-                        // It is reached by a plain browser navigation (a tap), which
-                        // cannot attach the Authorization header that lives in
-                        // localStorage. Requiring authentication at the filter layer
-                        // would reject every legitimate mobile download with a 403
-                        // before the controller ran.
+                        // It is reached by a plain browser navigation (a tap on
+                        // "Download PDF"), and a navigation cannot attach the
+                        // Authorization header that lives in localStorage. Leaving it
+                        // to fall through to anyRequest().authenticated() below makes
+                        // Spring reject every mobile download with a 403 before the
+                        // controller ever runs.
                         //
-                        // Authorization is NOT skipped - it moved into
-                        // NoteController.downloadNote, which accepts either
-                        //   (a) a valid JWT + completed purchase, or
+                        // permitAll here does NOT mean the PDF is public. Authorization
+                        // is enforced in NoteController.downloadNote, which requires
+                        // either
+                        //   (a) a valid JWT plus a completed purchase, or
                         //   (b) a single-use, 2-minute ticket that was itself only
                         //       mintable after a completed-purchase check, and which
                         //       re-verifies the purchase before streaming a byte.
-                        // Anything else returns 401/403 and no PDF is written.
+                        // Every other case returns 401/403 with an empty body, so no
+                        // PDF bytes are ever written to an unentitled caller.
+                        .requestMatchers(HttpMethod.GET, "/api/notes/*/download").permitAll()
+
+                        // --- signed-in users ---
                         .requestMatchers("/api/payment/**").authenticated()
                         .requestMatchers("/api/bundle/**").authenticated()
                         .requestMatchers("/api/user/**").authenticated()
