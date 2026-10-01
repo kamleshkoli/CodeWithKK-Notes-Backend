@@ -1,5 +1,6 @@
 package codewithkk.backend.controller;
 
+import codewithkk.backend.dto.AdminSubscriptionResponse;
 import codewithkk.backend.dto.StatsResponse;
 import codewithkk.backend.entity.BundlePurchase;
 import codewithkk.backend.entity.Note;
@@ -11,6 +12,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/admin")
@@ -73,5 +75,35 @@ public class AdminController {
     @GetMapping("/payments")
     public ResponseEntity<List<BundlePurchase>> getAllPayments() {
         return ResponseEntity.ok(userService.getAllPurchases());
+    }
+
+    // ---------- access management ----------
+    // The admin console called these three paths but the backend never
+    // implemented them, so every call fell through to the dispatcher and
+    // surfaced as a 500 "Internal server error".
+
+    /** Users plus their current access state. */
+    @GetMapping("/subscriptions")
+    public ResponseEntity<List<AdminSubscriptionResponse>> getSubscriptions() {
+        return ResponseEntity.ok(userService.getSubscriptions());
+    }
+
+    /**
+     * Grants premium access to the user with this email. Records a completed
+     * purchase so every existing access check honours it immediately.
+     *
+     * <p>Admin-only via the /api/admin/** rule in SecurityConfig.
+     */
+    @PostMapping("/grant-access")
+    public ResponseEntity<AdminSubscriptionResponse> grantAccess(
+            @RequestBody Map<String, String> body) {
+        userService.grantAccess(body.get("email"));
+        return userService.findSubscriptionByEmail(body.get("email"));
+    }
+
+    @DeleteMapping("/revoke-access/{userId}")
+    public ResponseEntity<Map<String, Object>> revokeAccess(@PathVariable String userId) {
+        userService.revokeAccess(userId);
+        return ResponseEntity.ok(Map.of("revoked", true, "userId", userId));
     }
 }
