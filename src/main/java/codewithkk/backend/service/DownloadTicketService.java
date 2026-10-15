@@ -1,16 +1,18 @@
 package codewithkk.backend.service;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.security.SecureRandom;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.Base64;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Optional;
 
 /**
- * Short-lived, single-use tickets that let a browser <em>navigate</em> to a
+ * Short-lived, signed tickets that let a browser <em>navigate</em> to a
  * protected PDF.
  *
  * <p>Why this exists: the download endpoint is protected by a bearer JWT, and a
@@ -23,81 +25,117 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>This is NOT a weakening of the access check. A ticket is only ever minted
  * after the caller has passed the same JWT + completed-purchase gate the
- * endpoint already enforced, and {@code consume} re-verifies the purchase
- * before streaming anything, so revoking access invalidates outstanding
- * tickets immediately.
+ * endpoint already enforced, and {@link #verify} re-checks the purchase in the
+ * controller before streaming anything, so revoking access invalidates
+ * outstanding tickets immediately.
  *
- * <p>Held in memory on purpose: tickets must not survive a restart and must not
- * be written to a shared store. Expiry is short and each ticket is destroyed on
- * first use.
+ * <p>Design note - why signed instead of a stored single-use token:
+ * an earlier version kept tickets in an in-memory map and burned them on first
+ * read. That 403'd real buyers on mobile, because a tap can produce more than
+ * one request to the URL (browser prefetch, a retried navigation) and because
+ * backgrounded tabs can delay the final navigation past a short expiry. It also
+ * broke outright if the app ran more than one instance, since the ticket was
+ * minted on one instance and consumed on another. A signed, stateless token is
+ * bound to a user and a note and carries its own expiry, so it survives all
+ * three without any shared state - an old or leaked link is still useless after
+ * a few minutes and only ever opens the one note it was minted for.
  */
 @Service
 public class DownloadTicketService {
 
-    /** Long enough to survive a slow tap, short enough to be useless if leaked. */
-    private static final long TTL_SECONDS = 120;
-
     /**
-     * Bound on outstanding tickets. The Render free instance has ~512MB and this
-     * map is never trimmed by size alone, so an unbounded map is a DoS vector.
+     * Long enough to survive a slow mobile hand-off (backgrounded tab, cold
+     * backend, retry), short enough that a leaked URL is of little use.
      */
-    private static final int MAX_TICKETS = 5_000;
+    private static final long TTL_SECONDS = 600;
 
-    private final Map<String, Ticket> tickets = new ConcurrentHashMap<>();
-    private final SecureRandom random = new SecureRandom();
+    private static final String HMAC_ALGORITHM = "HmacSHA256";
+    private static final String SEPARATOR = "|";
 
+    private final byte[] signingKey;
+
+    public DownloadTicketService(@Value("${app.jwt.secret}") String secret) {
+        this.signingKey = secret.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** Issues a signed, user+note-bound ticket that expires after the TTL. */
     public String issue(String userId, String noteId) {
-        if (tickets.size() >= MAX_TICKETS) {
-            evictExpired();
-            // Still full after a sweep means genuine abuse, not slow expiry.
-            if (tickets.size() >= MAX_TICKETS) {
-                throw new IllegalStateException("Too many pending downloads, try again shortly");
-            }
-        }
-        byte[] bytes = new byte[32];
-        random.nextBytes(bytes);
-        String token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
-        tickets.put(token, new Ticket(userId, noteId, Instant.now().plusSeconds(TTL_SECONDS)));
-        return token;
+        long expiresAt = Instant.now().getEpochSecond() + TTL_SECONDS;
+        String payload = userId + SEPARATOR + noteId + SEPARATOR + expiresAt;
+        String encodedPayload = encode(payload.getBytes(StandardCharsets.UTF_8));
+        return encodedPayload + "." + sign(encodedPayload);
     }
 
     /**
-     * Validates and burns a ticket.
+     * Validates a ticket for the given note.
      *
-     * <p>Single use is deliberate: a URL that works forever is a URL that can be
-     * pasted into a chat. Burning it on read means the link is only good for
-     * the one navigation it was created for.
+     * <p>Not single-use on purpose: reuse within the TTL is what makes the
+     * browser's extra/prefetched requests and delayed navigations harmless.
      *
-     * @return the ticket, or empty if unknown, expired, or already used
+     * @return the id of the user the ticket was minted for, or empty if the
+     *         token is malformed, its signature does not match, it has expired,
+     *         or it was minted for a different note
      */
-    public java.util.Optional<Ticket> consume(String token, String noteId) {
+    public Optional<String> verify(String token, String noteId) {
         if (token == null || token.isBlank()) {
-            return java.util.Optional.empty();
+            return Optional.empty();
         }
-        Ticket ticket = tickets.remove(token);
-        if (ticket == null) {
-            return java.util.Optional.empty();
+        int dot = token.lastIndexOf('.');
+        if (dot <= 0 || dot == token.length() - 1) {
+            return Optional.empty();
         }
-        if (ticket.expiresAt().isBefore(Instant.now())) {
-            return java.util.Optional.empty();
+        String encodedPayload = token.substring(0, dot);
+        String signature = token.substring(dot + 1);
+
+        // Constant-time compare so the signature cannot be guessed byte by byte.
+        if (!MessageDigest.isEqual(
+                sign(encodedPayload).getBytes(StandardCharsets.UTF_8),
+                signature.getBytes(StandardCharsets.UTF_8))) {
+            return Optional.empty();
+        }
+
+        String payload;
+        try {
+            payload = new String(Base64.getUrlDecoder().decode(encodedPayload), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return Optional.empty();
+        }
+
+        String[] parts = payload.split("\\" + SEPARATOR, 3);
+        if (parts.length != 3) {
+            return Optional.empty();
+        }
+        String userId = parts[0];
+        String ticketNoteId = parts[1];
+        long expiresAt;
+        try {
+            expiresAt = Long.parseLong(parts[2]);
+        } catch (NumberFormatException e) {
+            return Optional.empty();
+        }
+
+        if (Instant.now().getEpochSecond() > expiresAt) {
+            return Optional.empty();
         }
         // A ticket is bound to the note it was minted for, so it cannot be
         // replayed against a different PDF.
-        if (!ticket.noteId().equals(noteId)) {
-            return java.util.Optional.empty();
+        if (!ticketNoteId.equals(noteId)) {
+            return Optional.empty();
         }
-        return java.util.Optional.of(ticket);
+        return Optional.of(userId);
     }
 
-    private void evictExpired() {
-        Instant now = Instant.now();
-        for (Iterator<Map.Entry<String, Ticket>> it = tickets.entrySet().iterator(); it.hasNext(); ) {
-            if (it.next().getValue().expiresAt().isBefore(now)) {
-                it.remove();
-            }
+    private String sign(String data) {
+        try {
+            Mac mac = Mac.getInstance(HMAC_ALGORITHM);
+            mac.init(new SecretKeySpec(signingKey, HMAC_ALGORITHM));
+            return encode(mac.doFinal(data.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not sign download ticket", e);
         }
     }
 
-    public record Ticket(String userId, String noteId, Instant expiresAt) {
+    private static String encode(byte[] bytes) {
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
     }
 }

@@ -96,14 +96,21 @@ public class NoteController {
 
         String token = downloadTicketService.issue(user.get().getId(), id);
 
-        Map<String, Object> body = new HashMap<>();
-        body.put("url", "/api/notes/" + id + "/download?ticket=" + token);
-        body.put("filename", sanitizeFilename(note.getTitle()) + ".pdf");
-        body.put("expiresInSeconds", 120);
         // Lets the client ask for inline rendering instead of a forced download.
         // Android WebViews cannot display PDFs, so callers there should keep the
         // default "attachment" and let the OS save the file.
-        body.put("disposition", "inline".equalsIgnoreCase(disposition) ? "inline" : "attachment");
+        String dispositionValue = "inline".equalsIgnoreCase(disposition) ? "inline" : "attachment";
+
+        Map<String, Object> body = new HashMap<>();
+        // The disposition has to ride on the download URL too, not just sit in
+        // the response body: the browser navigates straight to this URL after
+        // the ticket call, so an omitted param makes /download fall back to
+        // "attachment" and silently breaks inline viewing on iOS and desktop.
+        body.put("url", "/api/notes/" + id + "/download?ticket=" + token
+                + "&disposition=" + dispositionValue);
+        body.put("filename", sanitizeFilename(note.getTitle()) + ".pdf");
+        body.put("expiresInSeconds", 600);
+        body.put("disposition", dispositionValue);
         return ResponseEntity.ok(body);
     }
 
@@ -125,16 +132,15 @@ public class NoteController {
         Optional<User> user = currentUser();
 
         if (ticket != null && !ticket.isBlank()) {
-            Optional<DownloadTicketService.Ticket> valid =
-                    downloadTicketService.consume(ticket, id);
-            if (valid.isEmpty()) {
-                // Expired, already used, or forged. Never falls back to trusting
-                // the ticket's contents.
+            Optional<String> ticketUserId = downloadTicketService.verify(ticket, id);
+            if (ticketUserId.isEmpty()) {
+                // Expired, forged, or minted for another note. Never falls back
+                // to trusting the ticket's contents.
                 return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
             }
             // Re-verify entitlement rather than trusting the ticket alone, so a
             // revoked user cannot use a ticket minted moments earlier.
-            user = userRepository.findById(valid.get().userId());
+            user = userRepository.findById(ticketUserId.get());
             if (user.isEmpty() || !hasAccess(user.get())) {
                 return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
             }
